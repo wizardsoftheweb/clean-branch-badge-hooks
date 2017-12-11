@@ -1,0 +1,181 @@
+#!/usr/bin/env python
+# pylint: disable=unused-import
+# pylint: disable=misplaced-comparison-constant
+
+# pylint: disable=C0111
+from argparse import ArgumentParser
+from errno import EEXIST
+from os import getcwd, makedirs, name
+from os.path import dirname, exists, join, realpath, relpath
+from shutil import copy, move
+
+# import os
+import logging
+import sys
+
+from pygit2 import GitError, Repository  # pylint: disable=E0611
+
+if 'nt' == name:
+    raise NotImplementedError(
+        'Native Windows support does not exist; '
+        'try running from WSL (if possible)'
+    )
+
+
+HOOKS = [
+    'post-checkout',
+    'post-commit',
+    'post-merge',
+    'prepare-commit-msg',
+]
+
+LOGGER = logging.getLogger('install')
+CONSOLE_HANDLER = logging.StreamHandler(stream=sys.stderr)
+CONSOLE_FORMATTER = logging.Formatter(
+    '[%(asctime)s][%(name)s][%(levelname)s] %(message)s'
+)
+CONSOLE_HANDLER.setFormatter(CONSOLE_FORMATTER)
+LOGGER.addHandler(CONSOLE_HANDLER)
+
+ORIGIN_DIR = realpath(
+    join(
+        getcwd(),
+        dirname(__file__),
+    )
+)
+
+try:
+    REPO = Repository(getcwd())
+except GitError:
+    LOGGER.critical("install must be run from a git repo")
+    raise
+
+
+ORIGIN_RUNNER_PATH = join(ORIGIN_DIR, 'tooling', 'clean_branch_badges')
+
+INSTALLED_HOOKS_DIR = join(REPO.path, 'hooks')
+INSTALLED_RUNNER_PATH = join('wotw', 'clean_branch_badges')
+
+
+def mkdir_p(directory_path):
+    try:
+        makedirs(directory_path)
+    except OSError as error:
+        if EEXIST != error.errno:
+            raise error
+
+
+def backup_old_file(abs_path):
+    LOGGER.info("Creating %s.bak", abs_path)
+    move(abs_path, "%s.bak" % (abs_path))
+
+
+def ensure_file_does_not_exist(abs_path, force=False):
+    if exists(abs_path):
+        LOGGER.warning("%s exists", abs_path)
+        if force:
+            backup_old_file(abs_path)
+        else:
+            raise OSError(EEXIST, "%s exists" % (abs_path))
+
+
+def install_hook_runner(hooks_dir=INSTALLED_HOOKS_DIR, force=False):
+    new_runner_path = join(hooks_dir, INSTALLED_RUNNER_PATH)
+    ensure_file_does_not_exist(new_runner_path, force)
+    LOGGER.info("Copying clean_branch_badges to %s", new_runner_path)
+    copy(ORIGIN_RUNNER_PATH, new_runner_path)
+
+
+def install_specific_hook(hook, hooks_dir=INSTALLED_HOOKS_DIR, force=False):
+    hook_path = join(hooks_dir, hook)
+    ensure_file_does_not_exist(hook_path, force)
+    LOGGER.info("Creating %s", hook_path)
+    relative_runner_path = relpath(
+        join(
+            REPO.path,
+            hooks_dir,
+            INSTALLED_RUNNER_PATH
+        ),
+        REPO.workdir,
+    )
+    with open(hook_path, 'w') as hook_file:
+        hook_file.write('''\
+#!/usr/bin/env bash
+
+%s $0 < /dev/stdin
+''' % (relative_runner_path))
+
+
+def install_hooks(hooks_dir=INSTALLED_HOOKS_DIR, force=False):
+    LOGGER.info("Attempting to install individual hooks")
+    for hook in HOOKS:
+        install_specific_hook(hook, hooks_dir, force)
+
+
+def create_install_dirs(hooks_dir):
+    mkdir_p(hooks_dir)
+    mkdir_p(join(hooks_dir, dirname(INSTALLED_RUNNER_PATH)))
+
+
+def install(hooks_dir=INSTALLED_HOOKS_DIR, force=False):
+    create_install_dirs(hooks_dir)
+    install_hook_runner(hooks_dir, force)
+    install_hooks(hooks_dir, force)
+
+
+def cli(args=None):  # pylint: disable=W0102
+    parser = ArgumentParser(
+        description='Installs this git tooling'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        dest='verbosity',
+        action='count',
+        default=0,
+        help='Increase output verbosity'
+    )
+    parser.add_argument(
+        '-f', '--force',
+        dest='force',
+        action='store_true',
+        default=False,
+        help=(
+            'Force installation. Requires at least -v|--verbose, '
+            'although -vvv is recommended'
+        )
+    )
+    parser.add_argument(
+        '-d', '--hooks-dir',
+        dest='hooks_dir',
+        default=INSTALLED_HOOKS_DIR,
+        help="git hooks directory (default %s)" % INSTALLED_HOOKS_DIR
+    )
+    parsed_args = parser.parse_args(args)
+    if parsed_args.force:
+        if parsed_args.verbosity > 0:
+            LOGGER.warn('SCRIPT CALLED WITH FORCE; HOOKS WILL BE OVERRIDDEN')
+        else:
+            raise ValueError(
+                '--force cannot be used without verbosity; '
+                'call again with at least -v'
+            )
+
+    if parsed_args.verbosity > 2:
+        LOGGER.setLevel(logging.DEBUG)
+        LOGGER.info('Logging everything')
+    elif parsed_args.verbosity > 1:
+        LOGGER.setLevel(logging.INFO)
+        LOGGER.info('Not logging debug messages')
+    elif parsed_args.verbosity > 0:
+        LOGGER.setLevel(logging.WARN)
+    else:
+        LOGGER.setLevel(logging.ERROR)
+    LOGGER.info(
+        "Attempting to install hooks in %s",
+        parsed_args.hooks_dir
+    )
+    install(parsed_args.hooks_dir, parsed_args.force)
+
+if '__main__' == __name__:
+    cli(sys.argv[1:])
+    sys.exit(0)

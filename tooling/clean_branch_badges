@@ -1,0 +1,498 @@
+#!/usr/bin/env python
+# pylint: disable=unused-import
+# pylint: disable=misplaced-comparison-constant
+# pylint: disable=W0613
+
+# pylint: disable=C0111
+"""This file filters badge branches"""
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from errno import EEXIST
+from os import fstat, getcwd, makedirs
+from os.path import basename, exists as pexists, join
+from shutil import rmtree
+from stat import S_ISFIFO
+from subprocess import call, check_output, PIPE
+
+import logging
+import re
+import sys
+
+from pygit2 import (  # pylint: disable=E0611
+    GIT_STATUS_CONFLICTED,
+    GIT_STATUS_CURRENT,
+    GIT_STATUS_IGNORED,
+    hash as pghash,
+    Signature,
+    Repository
+)
+from pygit2.repository import References
+
+LOGGER = logging.getLogger('post-checkout')
+CONSOLE_HANDLER = logging.StreamHandler(stream=sys.stderr)
+CONSOLE_FORMATTER = logging.Formatter(
+    '[%(asctime)s][%(name)s][%(levelname)s] %(message)s'
+)
+CONSOLE_HANDLER.setFormatter(CONSOLE_FORMATTER)
+LOGGER.addHandler(CONSOLE_HANDLER)
+
+# Python's glob implementation isn't very sophisticated.
+# git ls-tree doesn't do any globbing whatsoever.
+# For now, just manually include the files to track.
+# On not Windows, you can run something like
+# $ find . -type f -name 'README*'
+TRACKED_PATHS_RELATIVE_TO_REPO_ROOT = [
+    'README.rst',
+    'README.md'
+]
+REPO = Repository(getcwd())
+REFERENCE_CACHE = dict()
+
+SCRIPT_DIRECTORY = join(REPO.path, 'wotw')
+
+CONFIG_DIRECTORY = join(REPO.path, '.wotw')
+CURRENT_BRANCH_REF = REPO.head.target.hex
+CURRENT_BRANCH_SHORTHAND = REPO.head.shorthand
+CURRENT_BRANCH_FILE = join(CONFIG_DIRECTORY, 'current-branch')
+COMMIT_STATE_DIRECTORY = join(CONFIG_DIRECTORY, 'state', REPO.head.shorthand)
+COMMIT_STATE_ORIGIN = join(COMMIT_STATE_DIRECTORY, 'origin')
+COMMIT_STATE_PRE_MERGE_REF = join(COMMIT_STATE_DIRECTORY, 'pre-merge-ref')
+
+# From man githooks
+MERGE_COMMIT_TYPE = 'merge'
+
+# I'm explicitly coding my info here for two reasons:
+# 1. My script parsed the code, so I'm technically the author
+# 2. My info will be easily accessible in the blame when things break
+SCRIPTED_AUTHOR_NAME = 'CJ Harries'
+SCRIPTED_AUTHOR_EMAIL = 'cj@wizardsoftheweb.pro'
+
+PIPE_ARGS = False
+
+BADGE_PATTERN = re.compile(
+    r'''
+(?P<leading_url>    # Group everything leading the ref title
+    (?P<website>    # Must be one of these sites
+        coveralls
+        |
+        travis-ci
+    )
+    [^\s]+?         # Snag not space characters, giving back as needed
+    (?P<ref_title>  # Different websites call it different things
+        branch
+        |
+        tree
+    )
+    [^\w]           # There must be a trailing character, eg =
+)
+[^\s'\"]+           # Get everything else until these characters
+    ''',
+    re.VERBOSE
+)
+
+
+def determine_possible_reference_names(reference):  # pylint: disable=C0103
+    try:
+        return REFERENCE_CACHE[reference]
+    except KeyError:
+        LOGGER.warning(
+            "%s not found in (git show-ref | grep %s)",
+            reference,
+            reference
+        )
+    return None
+
+
+def cache_references():
+    LOGGER.debug("Loading references")
+    for ref_name in References(REPO):
+        if ref_name.startswith('refs/heads/'):
+            ref_object = REPO.lookup_reference(ref_name)
+            LOGGER.debug(
+                "Found '%s': '%s'",
+                ref_name,
+                ref_object.target.hex
+            )
+            existing_refs = REFERENCE_CACHE.get(ref_object.target.hex, list())
+            REFERENCE_CACHE[ref_object.target.hex] = (
+                existing_refs + [ref_object.shorthand]
+            )
+        else:
+            LOGGER.debug("Skipping external ref %s", ref_name)
+
+
+def update_file(path_relative_to_repo_root, new_contents):
+    LOGGER.debug("Writing updated content to %s", path_relative_to_repo_root)
+    with open(path_relative_to_repo_root, 'w') as open_file_object:
+        open_file_object.write(new_contents)
+    stage_single_file(path_relative_to_repo_root)
+
+
+def fix_contents(contents=""):
+    current_branch = REPO.head.shorthand
+    LOGGER.debug("Replacing all branch references with %s", current_branch)
+    return re.sub(BADGE_PATTERN, r'\1%s' % (current_branch), contents)
+
+
+def clean_single_file(path_relative_to_repo_root):
+    file_info = check_output([
+        'git',
+        'ls-files',
+        '--cached',
+        '--stage',
+        path_relative_to_repo_root,
+    ])
+    if not file_info:
+        LOGGER.warning(
+            "Unable to find %s in current tree; skipping",
+            path_relative_to_repo_root
+        )
+        return
+    file_hash = file_info.replace('\t', ' ').split(' ')[1]
+    LOGGER.debug("Old file hash is %s", file_hash)
+    contents = check_output(['git', 'cat-file', '-p', file_hash])
+    new_contents = fix_contents(contents)
+    new_hash = pghash(new_contents).__str__()
+    LOGGER.debug("New file hash is %s", new_hash)
+    hash_changed = file_hash != new_hash
+    if hash_changed:
+        LOGGER.info(
+            "Updating badges in %s",
+            path_relative_to_repo_root
+        )
+        update_file(path_relative_to_repo_root, new_contents)
+    else:
+        LOGGER.info(
+            "Badges use correct branch in %s",
+            path_relative_to_repo_root
+        )
+    return hash_changed
+
+
+def stage_single_file(path_relative_to_repo_root):
+    LOGGER.debug("Staging %s", path_relative_to_repo_root)
+    index = REPO.index
+    index.add(path_relative_to_repo_root)
+    index.write()
+
+
+def is_commit_a_merge():
+    if not pexists(COMMIT_STATE_ORIGIN):
+        return False
+    with open(COMMIT_STATE_ORIGIN, 'r') as commit_state:
+        commit_source, commit_type = commit_state.read().strip().split('\n')
+    LOGGER.debug(
+        "Commit message came from %s and is a %s",
+        commit_source,
+        commit_type
+    )
+    return 'merge' == commit_type
+
+
+def commit_or_amend_changes(commit_message, use_fresh_commit=False):
+    if not use_fresh_commit and is_commit_a_merge():
+        amend_changes()
+    else:
+        commit_changes(commit_message)
+    tidy_commit_state()
+
+
+def clean_everything(use_fresh_commit=False):
+    LOGGER.info("Cleaning tracked files")
+    commit_needed = False
+    for filename in TRACKED_PATHS_RELATIVE_TO_REPO_ROOT:
+        LOGGER.debug("Attempting to clean badges in %s", filename)
+        file_changed = clean_single_file(filename)
+        if file_changed:
+            commit_needed = True
+    if commit_needed:
+        commit_or_amend_changes(
+            "Ensure badges point to %s"
+            % (CURRENT_BRANCH_SHORTHAND),
+            use_fresh_commit
+        )
+
+
+def amend_changes():
+    last_commit = REPO.head.peel()
+    if (
+            last_commit.author
+            and
+            last_commit.message
+            and
+            last_commit.parent_ids
+    ):
+        LOGGER.info('Amending the previous commit')
+    else:
+        raise KeyError(
+            'Unable to properly parse last commit; '
+            'changes staged but not merged'
+        )
+    LOGGER.debug("Moving head to first parent")
+    REPO.head.set_target(last_commit.parent_ids[0])
+    LOGGER.debug("Amending commit (actually just making a new one)")
+    REPO.create_commit(
+        REPO.head.name,
+        last_commit.author,
+        Signature(SCRIPTED_AUTHOR_NAME, SCRIPTED_AUTHOR_EMAIL),
+        last_commit.message,
+        REPO.index.write_tree(),
+        last_commit.parent_ids,
+    )
+
+
+def commit_changes(commit_message):
+    LOGGER.info("Committing changes")
+    committer_name = None
+    LOGGER.debug("Determining committer name")
+    for value in REPO.config.get_multivar('user.name'):
+        if committer_name is None:
+            committer_name = value
+        else:
+            raise ValueError(
+                'Multiple user.name values found; '
+                'commit the staged changes directly from your shell'
+            )
+    LOGGER.debug("Using %s as the committer name", committer_name)
+    committer_email = None
+    LOGGER.debug("Determining committer email")
+    for value in REPO.config.get_multivar('user.email'):
+        if committer_email is None:
+            committer_email = value
+        else:
+            raise ValueError(
+                'Multiple user.email values found; '
+                'commit the staged changes directly from your shell'
+            )
+    LOGGER.debug("Using %s as the committer email", committer_email)
+    LOGGER.debug(
+        "Using %s <%s> as the author",
+        SCRIPTED_AUTHOR_NAME,
+        SCRIPTED_AUTHOR_EMAIL
+    )
+    tree = REPO.index.write_tree()
+    LOGGER.debug("Creating commit")
+    REPO.create_commit(
+        REPO.head.name,
+        Signature(SCRIPTED_AUTHOR_NAME, SCRIPTED_AUTHOR_EMAIL),
+        Signature(committer_name, committer_email),
+        commit_message,
+        tree,
+        [REPO.head.target.hex]
+    )
+
+
+def check_repo_status():
+    LOGGER.debug("Checking the repo status")
+    dirty = False
+    for filename, flags in REPO.status().items():
+        if flags == GIT_STATUS_CONFLICTED:
+            raise ValueError(
+                "Cannot commit conflicted file %s"
+                % (filename)
+            )
+        elif flags == GIT_STATUS_CURRENT or flags == GIT_STATUS_IGNORED:
+            continue
+        else:
+            LOGGER.debug("%s is dirty", filename)
+        dirty = True
+    return dirty
+
+
+def update_current_branch_file():
+    LOGGER.debug("Updating the current branch to %s", CURRENT_BRANCH_SHORTHAND)
+    with open(CURRENT_BRANCH_FILE, 'w+') as current_branch_file:
+        current_branch_file.write(CURRENT_BRANCH_SHORTHAND)
+    ignore_current_branch_file()
+
+
+def ignore_current_branch_file():
+    try:
+        if GIT_STATUS_IGNORED != REPO.status_file(join('.git', '.wotw', 'current-branch')):
+            LOGGER.debug("Adding .wotw to .git/info/exclude")
+            with open(join(REPO.path, 'info', 'exclude'), 'a') as git_ignore:
+                # Leading and trailing newlines are intentional
+                git_ignore.write('\n# Exclude WotW config\n.wotw\n')
+    except KeyError:
+        # Doesn't show up in the repo; good
+        pass
+
+
+def create_current_branch_file():
+    LOGGER.debug("Ensuring .wotw directory exists")
+    try:
+        makedirs(CONFIG_DIRECTORY)
+    except OSError as error:
+        if EEXIST != error.errno:
+            raise error
+    update_current_branch_file()
+    return None
+
+
+def load_saved_branch():
+    if pexists(CURRENT_BRANCH_FILE):
+        with open(CURRENT_BRANCH_FILE, 'r+') as current_branch_file:
+            found_branch = current_branch_file.read().strip()
+            LOGGER.debug("Saved branch is %s", found_branch)
+            return found_branch
+    else:
+        return create_current_branch_file()
+
+
+def on_different_branch():
+    saved_branch = load_saved_branch()
+    LOGGER.debug("Current branch is %s", CURRENT_BRANCH_SHORTHAND)
+    branch_changed = saved_branch != CURRENT_BRANCH_SHORTHAND
+    if branch_changed:
+        LOGGER.info(
+            "Saved branch '%s' does not match current branch '%s'; checking files",
+            saved_branch,
+            CURRENT_BRANCH_SHORTHAND
+        )
+    return branch_changed
+
+
+def clean_branch(use_fresh_commit=False, force_check=False):
+    if current_branch_exists():
+        if force_check or on_different_branch():
+            clean_everything(use_fresh_commit)
+            update_current_branch_file()
+        else:
+            LOGGER.debug("Branch does not appear to have changed")
+    else:
+        LOGGER.warning(
+            "The current branch (%s: %s) does not appear to be a valid ref; exiting",
+            CURRENT_BRANCH_SHORTHAND,
+            CURRENT_BRANCH_REF
+        )
+
+
+def current_branch_exists():
+    cache_references()
+    possible_refs = determine_possible_reference_names(CURRENT_BRANCH_REF)
+    return possible_refs is not None
+
+
+def tidy_commit_state():
+    if pexists(COMMIT_STATE_DIRECTORY):
+        rmtree(COMMIT_STATE_DIRECTORY)
+    makedirs(COMMIT_STATE_DIRECTORY)
+
+
+def prepare_commit_msg(args=None):
+    tidy_commit_state()
+    parser = ArgumentParser()
+    parser.add_argument('source')
+    parser.add_argument('type')
+    parsed_args = parser.parse_known_args(args)[0]
+    with open(COMMIT_STATE_ORIGIN, 'w') as commit_origin:
+        LOGGER.debug('Saving commit state to config directory')
+        commit_origin.write(
+            '%s\n%s\n' %
+            (parsed_args.source, parsed_args.type)
+        )
+    if '.git/MERGE_MSG' == parsed_args.source and 'merge' == parsed_args.type:
+        LOGGER.debug('Commit seems to be a merge; saving pre-merge ref')
+        with open(COMMIT_STATE_PRE_MERGE_REF, 'w') as commit_pre_merge:
+            commit_pre_merge.write(REPO.head.target.hex)
+
+
+def post_commit(args=None):
+    clean_branch()
+
+
+def post_merge(args=None):
+    clean_branch(False, True)
+
+
+def post_checkout(args=None):
+    clean_branch(True)
+
+HOOKS = {
+    'post-checkout': post_checkout,
+    'post-commit': post_commit,
+    'post-merge': post_merge,
+    'prepare-commit-msg': prepare_commit_msg
+}
+
+
+def cli(args=None):  # pylint: disable=W0102
+    parser = ArgumentParser(
+        # formatter_class=RawDescriptionHelpFormatter,
+        description='Parses out arguments for the hook_runner',
+        epilog="""If you've installed this directly, these options won't do
+        anything, as git doesn't know they exist. However, if you've got a more
+        complicated setup and are calling this runner from another runner,they
+        might be useful."""
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        dest='verbosity',
+        action='count',
+        default=0,
+        help='Increase output verbosity'
+    )
+    parser.add_argument(
+        '-p', '--pipe',
+        dest='pipe',
+        action='store_true',
+        help='Pass the original call to STDOUT before exiting (when successful)'
+    )
+    parser.add_argument(
+        'hook',
+        help='The originating git hook'
+    )
+    parser.add_argument(
+        'hook_args',
+        metavar='hook args',
+        nargs='*',
+        help='Arguments from git hooks. See man githooks for more information'
+    )
+    parsed_args = parser.parse_args(args)
+    if parsed_args.verbosity > 2:
+        LOGGER.setLevel(logging.DEBUG)
+        LOGGER.info('Logging everything')
+    elif parsed_args.verbosity > 1:
+        LOGGER.setLevel(logging.INFO)
+        LOGGER.info('Not logging debug messages')
+    elif parsed_args.verbosity > 0:
+        LOGGER.setLevel(logging.WARN)
+    else:
+        LOGGER.setLevel(logging.ERROR)
+    LOGGER.debug(
+        "Hook %s called with %s",
+        parsed_args.hook,
+        parsed_args.hook_args
+    )
+
+    try:
+        hook_name = basename(parsed_args.hook)
+        HOOKS[hook_name](parsed_args.hook_args)
+    except KeyError:
+        LOGGER.debug(
+            "Hook %s is not implemented; ignoring",
+            hook_name
+        )
+
+    exit_message = ''
+    if parsed_args.pipe:
+        LOGGER.debug('Pipe specified; rebuilding original call')
+        exit_message = (
+            "%s %s\n" %
+            (
+                parsed_args.hook,
+                ' '.join(parsed_args.hook_args)
+            )
+        )
+    exit_neatly(exit_message)
+
+
+def exit_neatly(exit_message):
+    CONSOLE_HANDLER.flush()
+    CONSOLE_HANDLER.close()
+    if exit_message:
+        sys.stdout.write(exit_message)
+    sys.exit(0)
+
+
+if '__main__' == __name__:
+    cli(sys.argv[1:])
